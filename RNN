@@ -283,12 +283,12 @@ if __name__ == "__main__":
         'dec_dropout': 0.3,
         'n_layers': 2,
         'batch_size': 64,
-        'n_epochs': 10,
+        'n_epochs': 20,
         'learning_rate': 0.001,  # 调高学习率
         'grad_clip': 1.0,
         'teacher_forcing_ratio': 0.5,
-        'sample_ratio': 0.1,
-        'max_samples': 10000  # 新增参数以限制数据样本数量
+        'sample_ratio': 1.0,  # 增加采样比例
+        'max_samples': 50000  # 增加最大样本数量
     }
     
     # 构建词汇表
