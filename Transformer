@@ -1,18 +1,18 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
-import time
-from torch.nn.utils.rnn import pad_sequence
+import torch.optim as optim
+from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
 import jieba_fast
 from collections import Counter
-from tqdm import tqdm
-from torch.cuda.amp import GradScaler, autocast
+import time
+from nltk.translate.bleu_score import corpus_bleu
 import matplotlib.pyplot as plt
 import random
-import torch.optim as optim
-from nltk.translate.bleu_score import corpus_bleu
+from tqdm import tqdm
+from torch.cuda.amp import GradScaler, autocast
+from sklearn.model_selection import train_test_split
 
 # 设置随机种子
 random.seed(42)
@@ -22,29 +22,30 @@ torch.cuda.manual_seed_all(42)
 # 设备配置
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 数据预处理
+# --------------------- 数据预处理 ---------------------
 class BilingualDataset(Dataset):
-    def __init__(self, src_file, tgt_file, src_vocab, tgt_vocab, max_len=50, sample_ratio=1):
+    def __init__(self, src_file, tgt_file, src_vocab, tgt_vocab, max_len=50, sample_ratio=1, max_samples=10000):
         with open(src_file, 'r', encoding='utf-8') as f_src, open(tgt_file, 'r', encoding='utf-8') as f_tgt:
-            src_lines = f_src.readlines()
-            tgt_lines = f_tgt.readlines()
+            src_lines = [line.strip() for line in f_src]
+            tgt_lines = [line.strip() for line in f_tgt]
         
         combined = list(zip(src_lines, tgt_lines))
         random.shuffle(combined)
-        sampled = combined[:int(len(combined) * sample_ratio)]
+        sampled = combined[:min(int(len(combined)*sample_ratio), max_samples)]
         self.src_data, self.tgt_data = zip(*sampled)
         
         self.src_vocab = src_vocab
         self.tgt_vocab = tgt_vocab
         self.max_len = max_len
 
+        # 预编码
         self.src_encoded = []
         self.tgt_encoded = []
         for src, tgt in zip(self.src_data, self.tgt_data):
             src_tokens = ['<sos>'] + src.lower().split()[:self.max_len-2] + ['<eos>']
-            tgt_tokens = ['<sos>'] + list(jieba_fast.cut(tgt))[:self.max_len-2] + ['<eos>']
-            
             src_ids = [self.src_vocab.get(token, self.src_vocab['<unk>']) for token in src_tokens]
+            
+            tgt_tokens = ['<sos>'] + list(jieba_fast.cut(tgt))[:self.max_len-2] + ['<eos>']
             tgt_ids = [self.tgt_vocab.get(token, self.tgt_vocab['<unk>']) for token in tgt_tokens]
             
             self.src_encoded.append(torch.tensor(src_ids, dtype=torch.long))
@@ -63,236 +64,155 @@ def build_vocab(file_path, tokenizer, max_vocab_size=5000):
             tokens = tokenizer(line.strip())
             counter.update(tokens)
     
-    vocab = {'<pad>': 0, '<sos>': 1, '<eos>': 2, '<unk>': 3}
+    vocab = {'<pad>':0, '<sos>':1, '<eos>':2, '<unk>':3}
     for token, _ in counter.most_common(max_vocab_size):
         vocab[token] = len(vocab)
     return vocab
 
-# Transformer模型定义
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, d_model)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
-    
-    def forward(self, x):
-        x = x + self.pe[:x.size(0)]
-        return self.dropout(x)
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, n_heads, dropout=0.1):
-        super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        
-        self.d_k = d_model // n_heads
-        self.n_heads = n_heads
-        
-        self.w_q = nn.Linear(d_model, d_model)
-        self.w_k = nn.Linear(d_model, d_model)
-        self.w_v = nn.Linear(d_model, d_model)
-        self.w_o = nn.Linear(d_model, d_model)
+# --------------------- 模型定义 ---------------------
+class TransformerModel(nn.Module):
+    def __init__(self, src_vocab_size, tgt_vocab_size, emb_dim, nhead, num_encoder_layers, num_decoder_layers, dim_feedforward, dropout):
+        super(TransformerModel, self).__init__()
+        self.src_embedding = nn.Embedding(src_vocab_size, emb_dim)
+        self.tgt_embedding = nn.Embedding(tgt_vocab_size, emb_dim)
+        self.transformer = nn.Transformer(d_model=emb_dim, nhead=nhead, num_encoder_layers=num_encoder_layers, num_decoder_layers=num_decoder_layers, dim_feedforward=dim_feedforward, dropout=dropout)
+        self.fc_out = nn.Linear(emb_dim, tgt_vocab_size)
         self.dropout = nn.Dropout(dropout)
-        self.scale = torch.sqrt(torch.FloatTensor([self.d_k])).to(device)
-    
-    def forward(self, query, key, value, mask=None):
-        batch_size = query.size(1)
         
-        Q = self.w_q(query).view(-1, batch_size, self.n_heads, self.d_k).transpose(1, 2)
-        K = self.w_k(key).view(-1, batch_size, self.n_heads, self.d_k).transpose(1, 2)
-        V = self.w_v(value).view(-1, batch_size, self.n_heads, self.d_k).transpose(1, 2)
-        
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-        
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
-        
-        attention = self.dropout(F.softmax(scores, dim=-1))
-        x = torch.matmul(attention, V).transpose(1, 2).contiguous().view(-1, batch_size, self.n_heads * self.d_k)
-        return self.w_o(x), attention
-
-class PositionwiseFeedforward(nn.Module):
-    def __init__(self, d_model, d_ff, dropout=0.1):
-        super().__init__()
-        self.linear1 = nn.Linear(d_model, d_ff)
-        self.linear2 = nn.Linear(d_ff, d_model)
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, x):
-        return self.linear2(self.dropout(F.relu(self.linear1(x))))
-
-class EncoderLayer(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
-        super().__init__()
-        self.self_attn = MultiHeadAttention(d_model, n_heads, dropout)
-        self.ffn = PositionwiseFeedforward(d_model, d_ff, dropout)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, src, src_mask=None):
-        src2, _ = self.self_attn(src, src, src, src_mask)
-        src = self.norm1(src + self.dropout(src2))
-        src2 = self.ffn(src)
-        src = self.norm2(src + self.dropout(src2))
-        return src
-
-class DecoderLayer(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
-        super().__init__()
-        self.self_attn = MultiHeadAttention(d_model, n_heads, dropout)
-        self.enc_attn = MultiHeadAttention(d_model, n_heads, dropout)
-        self.ffn = PositionwiseFeedforward(d_model, d_ff, dropout)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, trg, enc_src, trg_mask=None, src_mask=None):
-        trg2, _ = self.self_attn(trg, trg, trg, trg_mask)
-        trg = self.norm1(trg + self.dropout(trg2))
-        
-        trg2, attention = self.enc_attn(trg, enc_src, enc_src, src_mask)
-        trg = self.norm2(trg + self.dropout(trg2))
-        
-        trg2 = self.ffn(trg)
-        trg = self.norm3(trg + self.dropout(trg2))
-        
-        return trg, attention
-
-class Encoder(nn.Module):
-    def __init__(self, input_dim, d_model, n_layers, n_heads, d_ff, dropout, max_len=100):
-        super().__init__()
-        self.embedding = nn.Embedding(input_dim, d_model)
-        self.pos_encoding = PositionalEncoding(d_model, dropout, max_len)
-        self.layers = nn.ModuleList([EncoderLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)])
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, src, src_mask=None):
-        src = self.dropout(self.pos_encoding(self.embedding(src) * math.sqrt(self.embedding.embedding_dim)))
-        for layer in self.layers:
-            src = layer(src, src_mask)
-        return src
-
-class Decoder(nn.Module):
-    def __init__(self, output_dim, d_model, n_layers, n_heads, d_ff, dropout, max_len=100):
-        super().__init__()
-        self.embedding = nn.Embedding(output_dim, d_model)
-        self.pos_encoding = PositionalEncoding(d_model, dropout, max_len)
-        self.layers = nn.ModuleList([DecoderLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)])
-        self.fc = nn.Linear(d_model, output_dim)
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, trg, enc_src, trg_mask=None, src_mask=None):
-        trg = self.dropout(self.pos_encoding(self.embedding(trg) * math.sqrt(self.embedding.embedding_dim)))
-        attention = None
-        for layer in self.layers:
-            trg, attention = layer(trg, enc_src, trg_mask, src_mask)
-        return self.fc(trg), attention
-
-class Transformer(nn.Module):
-    def __init__(self, encoder, decoder, src_pad_idx, trg_pad_idx):
-        super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.src_pad_idx = src_pad_idx
-        self.trg_pad_idx = trg_pad_idx
-    
-    def make_src_mask(self, src):
-        return (src != self.src_pad_idx).unsqueeze(1).unsqueeze(2)
-    
-    def make_trg_mask(self, trg):
-        trg_pad_mask = (trg != self.trg_pad_idx).unsqueeze(1).unsqueeze(2)
-        trg_sub_mask = torch.tril(torch.ones((trg.size(0), trg.size(0)), device=device)).bool()
-        return trg_pad_mask & trg_sub_mask
-    
-    def forward(self, src, trg):
-        src_mask = self.make_src_mask(src)
-        trg_mask = self.make_trg_mask(trg)
-        enc_src = self.encoder(src, src_mask)
-        output, attention = self.decoder(trg, enc_src, trg_mask, src_mask)
+    def forward(self, src, tgt, src_mask, tgt_mask, src_padding_mask, tgt_padding_mask):
+        src_emb = self.dropout(self.src_embedding(src))
+        tgt_emb = self.dropout(self.tgt_embedding(tgt))
+        memory = self.transformer.encoder(src_emb, src_key_padding_mask=src_padding_mask)
+        output = self.transformer.decoder(tgt_emb, memory, tgt_mask=tgt_mask, memory_key_padding_mask=src_padding_mask, tgt_key_padding_mask=tgt_padding_mask)
+        output = self.fc_out(output)
         return output
 
-# 训练工具
+def generate_square_subsequent_mask(sz):
+    mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+    return mask
+
+def create_mask(src, tgt, pad_idx):
+    src_seq_len = src.shape[0]
+    tgt_seq_len = tgt.shape[0]
+
+    tgt_mask = generate_square_subsequent_mask(tgt_seq_len).to(device)
+    src_mask = torch.zeros((src_seq_len, src_seq_len)).type(torch.bool).to(device)
+
+    src_padding_mask = (src == pad_idx).transpose(0, 1).to(device)
+    tgt_padding_mask = (tgt == pad_idx).transpose(0, 1).to(device)
+    return src_mask, tgt_mask, src_padding_mask, tgt_padding_mask
+
+# --------------------- 训练工具 ---------------------
 def collate_fn(batch):
     src_batch, tgt_batch = zip(*batch)
     src_batch = pad_sequence(src_batch, padding_value=0, batch_first=True)
     tgt_batch = pad_sequence(tgt_batch, padding_value=0, batch_first=True)
     return src_batch.transpose(0, 1), tgt_batch.transpose(0, 1)
 
-def train(model, iterator, optimizer, criterion, scaler, config):
+def train(model, iterator, optimizer, criterion, scaler, pad_idx):
     model.train()
     epoch_loss = 0
+    
     for src, trg in tqdm(iterator, desc="训练中", leave=False):
         src, trg = src.to(device), trg.to(device)
+        trg_input = trg[:-1, :]
+        src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src, trg_input, pad_idx)
+
         optimizer.zero_grad(set_to_none=True)
+        
         with autocast():
-            output = model(src, trg[:-1])
+            output = model(src, trg_input, src_mask, tgt_mask, src_padding_mask, tgt_padding_mask)
             loss = criterion(output.reshape(-1, output.shape[-1]), trg[1:].reshape(-1))
+        
         scaler.scale(loss).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
+        
         epoch_loss += loss.item()
+    
     return epoch_loss / len(iterator)
 
-def evaluate(model, iterator, criterion):
+def evaluate(model, iterator, criterion, pad_idx):
     model.eval()
     epoch_loss = 0
     with torch.no_grad():
         for src, trg in tqdm(iterator, desc="评估中", leave=False):
             src, trg = src.to(device), trg.to(device)
-            output = model(src, trg[:-1])
+            trg_input = trg[:-1, :]
+            src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src, trg_input, pad_idx)
+            output = model(src, trg_input, src_mask, tgt_mask, src_padding_mask, tgt_padding_mask)
             loss = criterion(output.reshape(-1, output.shape[-1]), trg[1:].reshape(-1))
             epoch_loss += loss.item()
     return epoch_loss / len(iterator)
 
-def calculate_bleu(model, iterator, tgt_vocab, max_len=50):
+def calculate_bleu(model, iterator, tgt_vocab, max_len=50, n_grams=4, pad_idx=0):
     targets, predictions = [], []
     model.eval()
-    idx_to_word = {v: k for k, v in tgt_vocab.items()}
     with torch.no_grad():
         for src, trg in tqdm(iterator, desc="计算BLEU分数", leave=False):
             src = src.to(device)
             trg = trg.to(device)
-            trg_input = torch.ones(1, src.size(1), dtype=torch.long).to(device) * tgt_vocab['<sos>']
-            outputs = []
-            for _ in range(max_len):
-                output = model(src, trg_input)
-                pred_token = output.argmax(-1)[-1:, :]
-                outputs.append(pred_token)
-                trg_input = torch.cat([trg_input, pred_token], dim=0)
-            outputs = torch.cat(outputs, dim=0).transpose(0, 1)
-            for pred in outputs:
-                pred_sentence = [idx_to_word[token.item()] for token in pred if token.item() != tgt_vocab['<eos>']]
-                predictions.append(pred_sentence)
-            for tgt in trg.transpose(0, 1):
-                tgt_sentence = [idx_to_word[token.item()] for token in tgt[1:] if token.item() != tgt_vocab['<eos>']]
-                targets.append([tgt_sentence])
-    return corpus_bleu(targets, predictions, weights=(0.25, 0.25, 0.25, 0.25))
+            
+            # 初始输入是<sos>
+            input = torch.ones(src.size(1), dtype=torch.long).to(device) * tgt_vocab['<sos>']
+            src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src, input, pad_idx)
+            
+            outputs = torch.zeros(max_len, src.size(1), dtype=torch.long).to(device)
+            
+            for t in range(1, max_len):
+                output = model(src, input, src_mask, tgt_mask, src_padding_mask, tgt_padding_mask)
+                top1 = output.argmax(2)[-1, :]
+                outputs[t] = top1
+                input = torch.cat((input, top1.unsqueeze(0)), dim=0)
+                _, tgt_mask, _, tgt_padding_mask = create_mask(src, input, pad_idx)
+            
+            # 处理预测结果
+            predictions_batch = []
+            for pred in outputs[1:].t():  # 跳过<sos>
+                pred_sentence = []
+                for token in pred:
+                    if token.item() == tgt_vocab['<eos>']:
+                        break
+                    pred_sentence.append(str(token.item()))
+                predictions_batch.append(pred_sentence)
+            
+            # 处理目标结果
+            targets_batch = []
+            for tgt in trg.t():
+                tgt_sentence = []
+                for token in tgt[1:]:  # 跳过<sos>
+                    if token.item() == tgt_vocab['<eos>']:
+                        break
+                    tgt_sentence.append(str(token.item()))
+                targets_batch.append([tgt_sentence])  # NLTK需要列表的列表
+            
+            predictions.extend(predictions_batch)
+            targets.extend(targets_batch)
+    
+    weights = tuple((1./n_grams for _ in range(n_grams)))
+    return corpus_bleu(targets, predictions, weights=weights)
 
-# 主程序
+# --------------------- 主程序 ---------------------
 if __name__ == "__main__":
+    # 配置参数
     config = {
-        'enc_emb_dim': 256,
-        'dec_emb_dim': 256,
-        'd_model': 256,
-        'n_layers': 6,
-        'n_heads': 8,
-        'd_ff': 512,
-        'dropout': 0.1,
+        'emb_dim': 256,
+        'nhead': 8,
+        'num_encoder_layers': 3,
+        'num_decoder_layers': 3,
+        'dim_feedforward': 512,
+        'dropout': 0.3,
         'batch_size': 64,
         'n_epochs': 20,
-        'learning_rate': 0.0005,
+        'learning_rate': 0.001,  # 调高学习率
         'grad_clip': 1.0,
-        'sample_ratio': 0.1
+        'sample_ratio': 1.0,  # 增加采样比例
+        'max_samples': 50000  # 增加最大样本数量
     }
     
+    # 构建词汇表
     print("构建词汇表中...")
     en_tokenizer = lambda x: x.lower().split()
     zh_tokenizer = lambda x: list(jieba_fast.cut(x))
@@ -300,32 +220,58 @@ if __name__ == "__main__":
     en_vocab = build_vocab('WikiTitles.en-zh.en', en_tokenizer)
     zh_vocab = build_vocab('WikiTitles.en-zh.zh', zh_tokenizer)
     
+    # 数据加载
     print("准备数据加载器...")
-    train_dataset = BilingualDataset('WikiTitles.en-zh.en', 'WikiTitles.en-zh.zh', en_vocab, zh_vocab, sample_ratio=config['sample_ratio'])
-    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+    train_dataset = BilingualDataset(
+        'WikiTitles.en-zh.en', 'WikiTitles.en-zh.zh', 
+        en_vocab, zh_vocab,
+        sample_ratio=config['sample_ratio'],
+        max_samples=config['max_samples']
+    )
     
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # 初始化模型
     print("初始化模型中...")
-    encoder = Encoder(len(en_vocab), config['d_model'], config['n_layers'], config['n_heads'], config['d_ff'], config['dropout'])
-    decoder = Decoder(len(zh_vocab), config['d_model'], config['n_layers'], config['n_heads'], config['d_ff'], config['dropout'])
-    model = Transformer(encoder, decoder, en_vocab['<pad>'], zh_vocab['<pad>']).to(device)
+    model = TransformerModel(
+        src_vocab_size=len(en_vocab),
+        tgt_vocab_size=len(zh_vocab),
+        emb_dim=config['emb_dim'],
+        nhead=config['nhead'],
+        num_encoder_layers=config['num_encoder_layers'],
+        num_decoder_layers=config['num_decoder_layers'],
+        dim_feedforward=config['dim_feedforward'],
+        dropout=config['dropout']
+    ).to(device)
     
-    print(f"模型参数量: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    # 打印参数量
+    def count_parameters(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"模型参数量: {count_parameters(model):,}")
     
-    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+    # 优化器和损失函数
+    optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'])  # 使用AdamW优化器
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
-    criterion = nn.CrossEntropyLoss(ignore_index=zh_vocab['<pad>'], label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
     scaler = GradScaler(enabled=torch.cuda.is_available())
     
+    # 训练循环
     print("开始训练...")
     best_bleu = 0
     train_losses, val_losses, bleus = [], [], []
     start_time = time.time()
     
     for epoch in range(config['n_epochs']):
-        epoch_start = time.time()
-        train_loss = train(model, train_loader, optimizer, criterion, scaler, config)
-        val_loss = evaluate(model, train_loader, criterion)
-        bleu = calculate_bleu(model, train_loader, zh_vocab)
+        train_loss = train(model, train_loader, optimizer, criterion, scaler, pad_idx=0)
+        val_loss = evaluate(model, train_loader, criterion, pad_idx=0)
+        bleu = calculate_bleu(model, train_loader, zh_vocab, pad_idx=0)
         
         scheduler.step(val_loss)
         
@@ -335,16 +281,18 @@ if __name__ == "__main__":
         
         if bleu > best_bleu:
             best_bleu = bleu
-            torch.save(model.state_dict(), 'transformer_best.pt')
+            torch.save(model.state_dict(), 'best_model.pt')
         
-        epoch_time = time.time() - epoch_start
+        epoch_time = time.time() - start_time
         print(f"Epoch: {epoch+1:02} | 用时: {epoch_time:.2f}s")
-        print(f"\t训练损失: {train_loss:.3f} | 验证损失: {val_loss:.3f} | BLEU分数: {bleu:.3f}")
+        print(f"\t训练损失: {train_loss:.3f} | 验证损失: {val_loss:.3f} | BLEU-4分数: {bleu:.3f}")
     
+    # 训练结果
     total_time = time.time() - start_time
     print(f"\n训练完成! 总用时: {total_time//60:.0f}m {total_time%60:.0f}s")
-    print(f"最佳BLEU分数: {best_bleu:.3f}")
+    print(f"最佳BLEU-4分数: {best_bleu:.3f}")
     
+    # 绘制曲线
     plt.figure(figsize=(12, 4))
     plt.subplot(1, 2, 1)
     plt.plot(train_losses, label='训练损失')
@@ -360,5 +308,5 @@ if __name__ == "__main__":
     plt.legend()
     
     plt.tight_layout()
-    plt.savefig('transformer_training_curves.png')
+    plt.savefig('training_curves.png')
     plt.show()
