@@ -156,7 +156,7 @@ def calculate_bleu(model, iterator, tgt_vocab, max_len=50, n_grams=4, pad_idx=0)
             trg = trg.to(device)
             
             # 初始输入是<sos>
-            input = torch.ones(1, src.size(1), dtype=torch.long).to(device) * tgt_vocab['<sos>']
+            input = torch.ones(src.size(1), dtype=torch.long).to(device) * tgt_vocab['<sos>']
             src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src, input, pad_idx)
             
             outputs = torch.zeros(max_len, src.size(1), dtype=torch.long).to(device)
@@ -234,7 +234,7 @@ if __name__ == "__main__":
         batch_size=config['batch_size'],
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=8,  # 增加num_workers以并行加载数据
+        num_workers=4,
         pin_memory=True
     )
     
@@ -265,32 +265,29 @@ if __name__ == "__main__":
     # 训练循环
     print("开始训练...")
     best_bleu = 0
-    train_losses, val_losses, bleus = [], [], []
+    train_losses, val_losses = [], []
     start_time = time.time()
     
     for epoch in range(config['n_epochs']):
         train_loss = train(model, train_loader, optimizer, criterion, scaler, pad_idx=0)
         val_loss = evaluate(model, train_loader, criterion, pad_idx=0)
-        bleu = calculate_bleu(model, train_loader, zh_vocab, pad_idx=0)
         
         scheduler.step(val_loss)
         
         train_losses.append(train_loss)
         val_losses.append(val_loss)
-        bleus.append(bleu)
-        
-        if bleu > best_bleu:
-            best_bleu = bleu
-            torch.save(model.state_dict(), 'best_model.pt')
         
         epoch_time = time.time() - start_time
         print(f"Epoch: {epoch+1:02} | 用时: {epoch_time:.2f}s")
-        print(f"\t训练损失: {train_loss:.3f} | 验证损失: {val_loss:.3f} | BLEU-4分数: {bleu:.3f}")
+        print(f"\t训练损失: {train_loss:.3f} | 验证损失: {val_loss:.3f}")
+    
+    # 所有轮次训练完后计算BLEU分数
+    bleu = calculate_bleu(model, train_loader, zh_vocab, pad_idx=0)
+    print(f"最终BLEU-4分数: {bleu:.3f}")
     
     # 训练结果
     total_time = time.time() - start_time
     print(f"\n训练完成! 总用时: {total_time//60:.0f}m {total_time%60:.0f}s")
-    print(f"最佳BLEU-4分数: {best_bleu:.3f}")
     
     # 绘制曲线
     plt.figure(figsize=(12, 4))
@@ -302,7 +299,7 @@ if __name__ == "__main__":
     plt.legend()
     
     plt.subplot(1, 2, 2)
-    plt.plot(bleus, label='BLEU-4')
+    plt.plot([bleu] * len(train_losses), label='BLEU-4')
     plt.xlabel('Epoch')
     plt.ylabel('Score')
     plt.legend()
