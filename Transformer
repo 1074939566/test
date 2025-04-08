@@ -99,8 +99,8 @@ def create_mask(src, tgt, pad_idx):
     tgt_mask = generate_square_subsequent_mask(tgt_seq_len).to(device)
     src_mask = torch.zeros((src_seq_len, src_seq_len)).type(torch.bool).to(device)
 
-    src_padding_mask = (src == pad_idx).transpose(0, 1).to(device)
-    tgt_padding_mask = (tgt == pad_idx).transpose(0, 1).to(device)
+    src_padding_mask = (src == pad_idx).transpose(0, 1).to(device) if src.dim() > 1 else (src == pad_idx).to(device)
+    tgt_padding_mask = (tgt == pad_idx).transpose(0, 1).to(device) if tgt.dim() > 1 else (tgt == pad_idx).to(device)
     return src_mask, tgt_mask, src_padding_mask, tgt_padding_mask
 
 # --------------------- 训练工具 ---------------------
