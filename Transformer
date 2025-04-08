@@ -156,7 +156,7 @@ def calculate_bleu(model, iterator, tgt_vocab, max_len=50, n_grams=4, pad_idx=0)
             trg = trg.to(device)
             
             # 初始输入是<sos>
-            input = torch.ones(src.size(1), dtype=torch.long).to(device) * tgt_vocab['<sos>']
+            input = torch.ones(1, src.size(1), dtype=torch.long).to(device) * tgt_vocab['<sos>']
             src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src, input, pad_idx)
             
             outputs = torch.zeros(max_len, src.size(1), dtype=torch.long).to(device)
@@ -234,7 +234,7 @@ if __name__ == "__main__":
         batch_size=config['batch_size'],
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=4,
+        num_workers=8,  # 增加num_workers以并行加载数据
         pin_memory=True
     )
     
