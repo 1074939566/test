@@ -147,52 +147,47 @@ def evaluate(model, iterator, criterion, pad_idx):
             epoch_loss += loss.item()
     return epoch_loss / len(iterator)
 
-def calculate_bleu(model, iterator, tgt_vocab, max_len=50, n_grams=4, pad_idx=0):
-    targets, predictions = [], []
+# 新增快速BLEU计算函数
+def fast_calculate_bleu(model, data_loader, tgt_vocab, max_len=50):
     model.eval()
-    with torch.no_grad():
-        for src, trg in tqdm(iterator, desc="计算BLEU分数", leave=False):
-            src = src.to(device)
-            trg = trg.to(device)
+    targets = []
+    predictions = []
+    idx_to_token = {v:k for k,v in tgt_vocab.items()}
+    
+    with torch.no_grad(), autocast():
+        for src, trg in tqdm(data_loader, desc="快速BLEU计算"):
+            src, trg = src.to(device), trg.to(device)
             
-            # 初始输入是<sos>
-            input = torch.ones(src.size(1), dtype=torch.long).to(device) * tgt_vocab['<sos>']
-            src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src, input, pad_idx)
-            
-            outputs = torch.zeros(max_len, src.size(1), dtype=torch.long).to(device)
+            # 批量生成预测结果
+            memory = model.transformer.encoder(model.src_embedding(src))
+            outputs = torch.ones(max_len, src.size(1), dtype=torch.long).to(device) * tgt_vocab['<sos>']
             
             for t in range(1, max_len):
-                output = model(src, input, src_mask, tgt_mask, src_padding_mask, tgt_padding_mask)
-                top1 = output.argmax(2)[-1, :]
-                outputs[t] = top1
-                input = torch.cat((input, top1.unsqueeze(0)), dim=0)
-                _, tgt_mask, _, tgt_padding_mask = create_mask(src, input, pad_idx)
+                tgt_mask = generate_square_subsequent_mask(t).to(device)
+                output = model.transformer.decoder(model.tgt_embedding(outputs[:t]), memory, tgt_mask=tgt_mask)
+                logits = model.fc_out(output[-1])
+                outputs[t] = logits.argmax(-1)
             
-            # 处理预测结果
-            predictions_batch = []
-            for pred in outputs[1:].t():  # 跳过<sos>
-                pred_sentence = []
-                for token in pred:
-                    if token.item() == tgt_vocab['<eos>']:
+            # 转换为文本
+            for i in range(src.size(1)):
+                pred = outputs[1:, i].cpu().tolist()  # 跳过<sos>
+                pred_tokens = []
+                for idx in pred:
+                    if idx == tgt_vocab['<eos>']:
                         break
-                    pred_sentence.append(str(token.item()))
-                predictions_batch.append(pred_sentence)
-            
-            # 处理目标结果
-            targets_batch = []
-            for tgt in trg.t():
-                tgt_sentence = []
-                for token in tgt[1:]:  # 跳过<sos>
-                    if token.item() == tgt_vocab['<eos>']:
+                    pred_tokens.append(idx_to_token.get(idx, '<unk>'))
+                
+                tgt = trg[1:, i].cpu().tolist()  # 跳过<sos>
+                tgt_tokens = []
+                for idx in tgt:
+                    if idx == tgt_vocab['<eos>']:
                         break
-                    tgt_sentence.append(str(token.item()))
-                targets_batch.append([tgt_sentence])  # NLTK需要列表的列表
-            
-            predictions.extend(predictions_batch)
-            targets.extend(targets_batch)
-    
-    weights = tuple((1./n_grams for _ in range(n_grams)))
-    return corpus_bleu(targets, predictions, weights=weights)
+                    tgt_tokens.append(idx_to_token.get(idx, '<unk>'))
+                
+                predictions.append(pred_tokens)
+                targets.append([tgt_tokens])  # NLTK格式要求
+
+    return corpus_bleu(targets, predictions, weights=(0.25, 0.25, 0.25, 0.25))
 
 # --------------------- 主程序 ---------------------
 if __name__ == "__main__":
@@ -205,7 +200,7 @@ if __name__ == "__main__":
         'dim_feedforward': 512,
         'dropout': 0.3,
         'batch_size': 64,
-        'n_epochs': 20,
+        'n_epochs': 1,
         'learning_rate': 0.001,  # 调高学习率
         'grad_clip': 1.0,
         'sample_ratio': 1.0,  # 增加采样比例
@@ -229,14 +224,26 @@ if __name__ == "__main__":
         max_samples=config['max_samples']
     )
     
+    # 数据分割：增加验证集
+    train_data, val_data = train_test_split(list(zip(train_dataset.src_encoded, train_dataset.tgt_encoded)), 
+                                          test_size=0.1, random_state=42)
+    
+    # 创建训练集DataLoader
     train_loader = DataLoader(
-        train_dataset,
+        BilingualDataset(train_data, en_vocab, zh_vocab),
         batch_size=config['batch_size'],
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=4,
+        num_workers=8,  # 增加num_workers以并行加载数据
         pin_memory=True
     )
+
+    # 创建验证集DataLoader
+    val_dataset = torch.utils.data.TensorDataset(
+        pad_sequence([x[0] for x in val_data], padding_value=0).transpose(0, 1),
+        pad_sequence([x[1] for x in val_data], padding_value=0).transpose(0, 1)
+    )
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size']*2, collate_fn=collate_fn)
     
     # 初始化模型
     print("初始化模型中...")
@@ -270,7 +277,7 @@ if __name__ == "__main__":
     
     for epoch in range(config['n_epochs']):
         train_loss = train(model, train_loader, optimizer, criterion, scaler, pad_idx=0)
-        val_loss = evaluate(model, train_loader, criterion, pad_idx=0)
+        val_loss = evaluate(model, val_loader, criterion, pad_idx=0)
         
         scheduler.step(val_loss)
         
@@ -280,10 +287,13 @@ if __name__ == "__main__":
         epoch_time = time.time() - start_time
         print(f"Epoch: {epoch+1:02} | 用时: {epoch_time:.2f}s")
         print(f"\t训练损失: {train_loss:.3f} | 验证损失: {val_loss:.3f}")
-    
-    # 所有轮次训练完后计算BLEU分数
-    bleu = calculate_bleu(model, train_loader, zh_vocab, pad_idx=0)
+
+    # 训练结束后计算BLEU分数
+    bleu = fast_calculate_bleu(model, val_loader, zh_vocab)
     print(f"最终BLEU-4分数: {bleu:.3f}")
+    if bleu > best_bleu:
+        best_bleu = bleu
+        torch.save(model.state_dict(), 'best_model.pth')
     
     # 训练结果
     total_time = time.time() - start_time
