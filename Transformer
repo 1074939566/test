@@ -200,7 +200,7 @@ if __name__ == "__main__":
         'dim_feedforward': 512,
         'dropout': 0.3,
         'batch_size': 64,
-        'n_epochs': 1,
+        'n_epochs': 20,
         'learning_rate': 0.001,  # 调高学习率
         'grad_clip': 1.0,
         'sample_ratio': 1.0,  # 增加采样比例
@@ -225,12 +225,17 @@ if __name__ == "__main__":
     )
     
     # 数据分割：增加验证集
-    train_data, val_data = train_test_split(list(zip(train_dataset.src_encoded, train_dataset.tgt_encoded)), 
-                                          test_size=0.1, random_state=42)
-    
+    train_data, val_data = train_test_split(
+        list(zip(train_dataset.src_encoded, train_dataset.tgt_encoded)), 
+        test_size=0.1, random_state=42
+    )
+
     # 创建训练集DataLoader
     train_loader = DataLoader(
-        BilingualDataset(train_data, en_vocab, zh_vocab),
+        torch.utils.data.TensorDataset(
+            pad_sequence([x[0] for x in train_data], padding_value=0).transpose(0, 1),
+            pad_sequence([x[1] for x in train_data], padding_value=0).transpose(0, 1)
+        ),
         batch_size=config['batch_size'],
         shuffle=True,
         collate_fn=collate_fn,
@@ -239,11 +244,14 @@ if __name__ == "__main__":
     )
 
     # 创建验证集DataLoader
-    val_dataset = torch.utils.data.TensorDataset(
-        pad_sequence([x[0] for x in val_data], padding_value=0).transpose(0, 1),
-        pad_sequence([x[1] for x in val_data], padding_value=0).transpose(0, 1)
+    val_loader = DataLoader(
+        torch.utils.data.TensorDataset(
+            pad_sequence([x[0] for x in val_data], padding_value=0).transpose(0, 1),
+            pad_sequence([x[1] for x in val_data], padding_value=0).transpose(0, 1)
+        ),
+        batch_size=config['batch_size'] * 2,
+        collate_fn=collate_fn
     )
-    val_loader = DataLoader(val_dataset, batch_size=config['batch_size']*2, collate_fn=collate_fn)
     
     # 初始化模型
     print("初始化模型中...")
