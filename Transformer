@@ -1,3 +1,194 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.nn import functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+import jieba_fast
+from collections import Counter
+import time
+from nltk.translate.bleu_score import corpus_bleu
+import matplotlib.pyplot as plt
+import random
+from tqdm import tqdm
+from torch.cuda.amp import GradScaler, autocast
+from sklearn.model_selection import train_test_split
+
+# 设置随机种子
+random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+
+# 设备配置
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# --------------------- 数据预处理 ---------------------
+class BilingualDataset(Dataset):
+    def __init__(self, src_file, tgt_file, src_vocab, tgt_vocab, max_len=50, sample_ratio=1, max_samples=10000):
+        with open(src_file, 'r', encoding='utf-8') as f_src, open(tgt_file, 'r', encoding='utf-8') as f_tgt:
+            src_lines = [line.strip() for line in f_src]
+            tgt_lines = [line.strip() for line in f_tgt]
+        
+        combined = list(zip(src_lines, tgt_lines))
+        random.shuffle(combined)
+        sampled = combined[:min(int(len(combined)*sample_ratio), max_samples)]
+        self.src_data, self.tgt_data = zip(*sampled)
+        
+        self.src_vocab = src_vocab
+        self.tgt_vocab = tgt_vocab
+        self.max_len = max_len
+
+        # 预编码
+        self.src_encoded = []
+        self.tgt_encoded = []
+        for src, tgt in zip(self.src_data, self.tgt_data):
+            src_tokens = ['<sos>'] + src.lower().split()[:self.max_len-2] + ['<eos>']
+            src_ids = [self.src_vocab.get(token, self.src_vocab['<unk>']) for token in src_tokens]
+            
+            tgt_tokens = ['<sos>'] + list(jieba_fast.cut(tgt))[:self.max_len-2] + ['<eos>']
+            tgt_ids = [self.tgt_vocab.get(token, self.tgt_vocab['<unk>']) for token in tgt_tokens]
+            
+            self.src_encoded.append(torch.tensor(src_ids, dtype=torch.long))
+            self.tgt_encoded.append(torch.tensor(tgt_ids, dtype=torch.long))
+
+    def __len__(self):
+        return len(self.src_data)
+
+    def __getitem__(self, idx):
+        return self.src_encoded[idx], self.tgt_encoded[idx]
+
+def build_vocab(file_path, tokenizer, max_vocab_size=5000):
+    counter = Counter()
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in tqdm(f, desc=f"Building vocab from {file_path}"):
+            tokens = tokenizer(line.strip())
+            counter.update(tokens)
+    
+    vocab = {'<pad>':0, '<sos>':1, '<eos>':2, '<unk>':3}
+    for token, _ in counter.most_common(max_vocab_size):
+        vocab[token] = len(vocab)
+    return vocab
+
+# --------------------- 模型定义 ---------------------
+class TransformerModel(nn.Module):
+    def __init__(self, src_vocab_size, tgt_vocab_size, emb_dim, nhead, num_encoder_layers, num_decoder_layers, dim_feedforward, dropout):
+        super(TransformerModel, self).__init__()
+        self.src_embedding = nn.Embedding(src_vocab_size, emb_dim)
+        self.tgt_embedding = nn.Embedding(tgt_vocab_size, emb_dim)
+        self.transformer = nn.Transformer(d_model=emb_dim, nhead=nhead, num_encoder_layers=num_encoder_layers, num_decoder_layers=num_decoder_layers, dim_feedforward=dim_feedforward, dropout=dropout)
+        self.fc_out = nn.Linear(emb_dim, tgt_vocab_size)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, src, tgt, src_mask, tgt_mask, src_padding_mask, tgt_padding_mask):
+        src_emb = self.dropout(self.src_embedding(src))
+        tgt_emb = self.dropout(self.tgt_embedding(tgt))
+        memory = self.transformer.encoder(src_emb, src_key_padding_mask=src_padding_mask)
+        output = self.transformer.decoder(tgt_emb, memory, tgt_mask=tgt_mask, memory_key_padding_mask=src_padding_mask, tgt_key_padding_mask=tgt_padding_mask)
+        output = self.fc_out(output)
+        return output
+
+def generate_square_subsequent_mask(sz):
+    mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+    return mask
+
+def create_mask(src, tgt, pad_idx):
+    src_seq_len = src.shape[0]
+    tgt_seq_len = tgt.shape[0]
+
+    tgt_mask = generate_square_subsequent_mask(tgt_seq_len).to(device)
+    src_mask = torch.zeros((src_seq_len, src_seq_len)).type(torch.bool).to(device)
+
+    src_padding_mask = (src == pad_idx).transpose(0, 1).to(device) if src.dim() > 1 else (src == pad_idx).to(device)
+    tgt_padding_mask = (tgt == pad_idx).transpose(0, 1).to(device) if tgt.dim() > 1 else (tgt == pad_idx).to(device)
+    return src_mask, tgt_mask, src_padding_mask, tgt_padding_mask
+
+# --------------------- 训练工具 ---------------------
+def collate_fn(batch):
+    src_batch, tgt_batch = zip(*batch)
+    src_batch = pad_sequence(src_batch, padding_value=0, batch_first=True)
+    tgt_batch = pad_sequence(tgt_batch, padding_value=0, batch_first=True)
+    return src_batch.transpose(0, 1), tgt_batch.transpose(0, 1)
+
+def train(model, iterator, optimizer, criterion, scaler, pad_idx):
+    model.train()
+    epoch_loss = 0
+    
+    for src, trg in tqdm(iterator, desc="训练中", leave=False):
+        src, trg = src.to(device), trg.to(device)
+        trg_input = trg[:-1, :]
+        src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src, trg_input, pad_idx)
+
+        optimizer.zero_grad(set_to_none=True)
+        
+        with autocast():
+            output = model(src, trg_input, src_mask, tgt_mask, src_padding_mask, tgt_padding_mask)
+            loss = criterion(output.reshape(-1, output.shape[-1]), trg[1:].reshape(-1))
+        
+        scaler.scale(loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        
+        epoch_loss += loss.item()
+    
+    return epoch_loss / len(iterator)
+
+def evaluate(model, iterator, criterion, pad_idx):
+    model.eval()
+    epoch_loss = 0
+    with torch.no_grad():
+        for src, trg in tqdm(iterator, desc="评估中", leave=False):
+            src, trg = src.to(device), trg.to(device)
+            trg_input = trg[:-1, :]
+            src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src, trg_input, pad_idx)
+            output = model(src, trg_input, src_mask, tgt_mask, src_padding_mask, tgt_padding_mask)
+            loss = criterion(output.reshape(-1, output.shape[-1]), trg[1:].reshape(-1))
+            epoch_loss += loss.item()
+    return epoch_loss / len(iterator)
+
+# 新增快速BLEU计算函数
+def fast_calculate_bleu(model, data_loader, tgt_vocab, max_len=50):
+    model.eval()
+    targets = []
+    predictions = []
+    idx_to_token = {v:k for k,v in tgt_vocab.items()}
+    
+    with torch.no_grad(), autocast():
+        for src, trg in tqdm(data_loader, desc="快速BLEU计算"):
+            src, trg = src.to(device), trg.to(device)
+            
+            # 批量生成预测结果
+            memory = model.transformer.encoder(model.src_embedding(src))
+            outputs = torch.ones(max_len, src.size(1), dtype=torch.long).to(device) * tgt_vocab['<sos>']
+            
+            for t in range(1, max_len):
+                tgt_mask = generate_square_subsequent_mask(t).to(device)
+                output = model.transformer.decoder(model.tgt_embedding(outputs[:t]), memory, tgt_mask=tgt_mask)
+                logits = model.fc_out(output[-1])
+                outputs[t] = logits.argmax(-1)
+            
+            # 转换为文本
+            for i in range(src.size(1)):
+                pred = outputs[1:, i].cpu().tolist()  # 跳过<sos>
+                pred_tokens = []
+                for idx in pred:
+                    if idx == tgt_vocab['<eos>']:
+                        break
+                    pred_tokens.append(idx_to_token.get(idx, '<unk>'))
+                
+                tgt = trg[1:, i].cpu().tolist()  # 跳过<sos>
+                tgt_tokens = []
+                for idx in tgt:
+                    if idx == tgt_vocab['<eos>']:
+                        break
+                    tgt_tokens.append(idx_to_token.get(idx, '<unk>'))
+                
+                predictions.append(pred_tokens)
+                targets.append([tgt_tokens])  # NLTK格式要求
+
+    return corpus_bleu(targets, predictions, weights=(0.25, 0.25, 0.25, 0.25))
+
 # --------------------- 主程序 ---------------------
 if __name__ == "__main__":
     # 配置参数
