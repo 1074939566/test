@@ -1,0 +1,56 @@
+import cv2
+import os
+import matplotlib.pyplot as plt
+
+# 定义处理图片的文件夹路径
+folder_path = "./d1"  # 本地的 d1 文件夹路径
+
+# 获取文件夹中的所有图片文件
+image_files = [f for f in os.listdir(folder_path) if f.endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff'))]
+
+# 仅处理前3张图片
+image_files = image_files[:3]
+
+# 遍历文件夹中的每一张图片
+for image_file in image_files:
+    image_path = os.path.join(folder_path, image_file)
+    
+    # 读取图像
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"无法读取文件: {image_file}")
+        continue
+
+    # 转换为灰度图像
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # 计算灰度图像直方图
+    gray_hist = cv2.calcHist([gray_image], [0], None, [256], [0, 256])
+
+    # 计算彩色图像直方图
+    colors = ('b', 'g', 'r')  # OpenCV 使用 BGR 顺序
+    color_hists = {color: cv2.calcHist([image], [i], None, [256], [0, 256]) for i, color in enumerate(colors)}
+
+    # 显示直方图
+    plt.figure(figsize=(12, 6))
+    
+    # 显示灰度直方图
+    plt.subplot(1, 2, 1)
+    plt.title(f"Grayscale Histogram - {image_file}")
+    plt.xlabel("Pixel Intensity")
+    plt.ylabel("Frequency")
+    plt.plot(gray_hist, color='black')
+    plt.xlim([0, 256])
+
+    # 显示彩色直方图
+    plt.subplot(1, 2, 2)
+    plt.title(f"Color Histogram - {image_file}")
+    plt.xlabel("Pixel Intensity")
+    plt.ylabel("Frequency")
+    for color, hist in color_hists.items():
+        plt.plot(hist, color=color)
+    plt.xlim([0, 256])
+
+    # 显示结果
+    plt.tight_layout()
+    plt.show()

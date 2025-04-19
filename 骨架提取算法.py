@@ -1,0 +1,104 @@
+import cv2
+import os
+import numpy as np
+import random
+import time
+
+def skeletonize(image):
+    """
+    实现二值图像的骨架提取
+    :param image: 输入的二值图像
+    :return: 骨架化后的图像
+    """
+    # 确保图像为二值图像
+    _, binary = cv2.threshold(image, 127, 255, cv2.THRESH_BINARY)
+
+    # 创建一个空白图像用于存储骨架
+    skeleton = np.zeros_like(binary)
+
+    # 定义一个形态学核
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+    # 循环执行细化操作，直到图像中没有前景像素
+    while True:
+        # 执行腐蚀操作
+        eroded = cv2.erode(binary, kernel)
+        
+        # 执行膨胀操作
+        temp = cv2.dilate(eroded, kernel)
+        
+        # 计算腐蚀后的差值
+        temp = cv2.subtract(binary, temp)
+        
+        # 将差值叠加到骨架上
+        skeleton = cv2.bitwise_or(skeleton, temp)
+        
+        # 更新二值图像
+        binary = eroded.copy()
+        
+        # 如果图像中没有前景像素，则退出循环
+        if cv2.countNonZero(binary) == 0:
+            break
+
+    return skeleton
+
+def evaluate_skeleton(image, skeleton):
+    """
+    计算骨架相关的评估指标
+    :param image: 原始的二值图像
+    :param skeleton: 骨架化后的图像
+    :return: 评估指标字典
+    """
+    # 原始前景像素数量
+    original_foreground_pixel_count = cv2.countNonZero(image)
+    # 骨架像素数量
+    skeleton_pixel_count = cv2.countNonZero(skeleton)
+    # 前景保留率
+    if original_foreground_pixel_count > 0:
+        foreground_retention_ratio = skeleton_pixel_count / original_foreground_pixel_count
+    else:
+        foreground_retention_ratio = 0.0
+
+    return {
+        "original_foreground_pixel_count": original_foreground_pixel_count,
+        "skeleton_pixel_count": skeleton_pixel_count,
+        "foreground_retention_ratio": foreground_retention_ratio
+    }
+
+# 定义处理图片的文件夹路径
+folder_path = "./d1"  # 本地的 d1 文件夹路径
+
+# 获取文件夹中的所有图片文件
+image_files = [f for f in os.listdir(folder_path) if f.endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff'))]
+
+# 确保文件夹中有图片
+if len(image_files) == 0:
+    print("文件夹中没有找到图片文件！")
+else:
+    # 随机选择一张图片
+    random_image = random.choice(image_files)
+    image_path = os.path.join(folder_path, random_image)
+    print(f"随机选择的图片: {random_image}")
+
+    # 加载选中的图片并转换为灰度图像
+    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+
+    # 骨架提取计时开始
+    start_time = time.time()
+    skeleton = skeletonize(image)
+    end_time = time.time()
+    skeletonization_time = end_time - start_time
+
+    # 评估骨架提取结果
+    metrics = evaluate_skeleton(image, skeleton)
+    print("\n评估指标:")
+    print(f"1. 原始前景像素数量: {metrics['original_foreground_pixel_count']}")
+    print(f"2. 骨架像素数量: {metrics['skeleton_pixel_count']}")
+    print(f"3. 前景保留率: {metrics['foreground_retention_ratio']:.2f}")
+    print(f"4. 骨架化时间: {skeletonization_time:.4f} 秒")
+
+    # 展示结果
+    cv2.imshow("Original Image", image)
+    cv2.imshow("Skeletonized Image", skeleton)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
