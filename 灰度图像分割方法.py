@@ -1,0 +1,72 @@
+import cv2
+import os
+import matplotlib.pyplot as plt
+
+# 定义处理图片的文件夹路径
+folder_path = "./d1"  # 本地的 d1 文件夹路径
+
+# 获取文件夹中的所有图片文件
+image_files = [f for f in os.listdir(folder_path) if f.endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff'))]
+small_test_set = image_files[:5]  # 少量图片（前 5 张）
+
+# 分割方法
+def threshold_segmentation(image):
+    """
+    方法 1: 全局阈值分割
+    ---------------------
+    使用固定的全局阈值将灰度图像分割为前景和背景。
+    """
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)  # 转换为灰度图像
+    _, global_thresh = cv2.threshold(gray_image, 127, 255, cv2.THRESH_BINARY)  # 全局阈值分割
+
+    """
+    方法 2: 自适应阈值分割
+    ---------------------
+    根据图像的局部区域动态计算阈值，适用于光照不均匀的图像。
+    """
+    adaptive_thresh_mean = cv2.adaptiveThreshold(gray_image, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 11, 2)  # 自适应均值分割
+    adaptive_thresh_gaussian = cv2.adaptiveThreshold(gray_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)  # 自适应高斯分割
+
+    return gray_image, global_thresh, adaptive_thresh_mean, adaptive_thresh_gaussian
+
+# 显示分割结果
+for image_file in small_test_set:
+    image_path = os.path.join(folder_path, image_file)
+    image = cv2.imread(image_path)
+
+    if image is None:
+        print(f"无法读取文件: {image_file}")
+        continue
+
+    # 执行分割
+    gray_image, global_thresh, adaptive_thresh_mean, adaptive_thresh_gaussian = threshold_segmentation(image)
+
+    # 绘制结果
+    plt.figure(figsize=(12, 8))
+    
+    # 原始灰度图像
+    plt.subplot(2, 2, 1)
+    plt.title(f"Original Gray Image - {image_file}")
+    plt.imshow(gray_image, cmap='gray')
+    plt.axis('off')
+
+    # 全局阈值分割结果
+    plt.subplot(2, 2, 2)
+    plt.title("Global Thresholding")
+    plt.imshow(global_thresh, cmap='gray')
+    plt.axis('off')
+
+    # 自适应均值阈值分割结果
+    plt.subplot(2, 2, 3)
+    plt.title("Adaptive Mean Thresholding")
+    plt.imshow(adaptive_thresh_mean, cmap='gray')
+    plt.axis('off')
+
+    # 自适应高斯阈值分割结果
+    plt.subplot(2, 2, 4)
+    plt.title("Adaptive Gaussian Thresholding")
+    plt.imshow(adaptive_thresh_gaussian, cmap='gray')
+    plt.axis('off')
+
+    plt.tight_layout()
+    plt.show()
